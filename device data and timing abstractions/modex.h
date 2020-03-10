@@ -58,7 +58,7 @@
 #define SCROLL_X_WIDTH  (IMAGE_X_DIM / 4)          /* addresses (bytes)     */
 #define BLOCK_SIZE     144
 
-unsigned char mask_image[BLOCK_SIZE];
+
 /*
  * NOTES
  *
@@ -141,9 +141,20 @@ extern int draw_horiz_line(int y);
 /* draw a vertical line at horizontal pixel x within the logical view window */
 extern int draw_vert_line(int x);
 
-void add_bar(int time, int level, int fruit,unsigned char* color_buffer, unsigned char color_bg, unsigned char color_text);
+extern void get_full_block(int pos_x, int pos_y, unsigned char *blk);
+
+extern void draw_mask(int pos_x, int pos_y, unsigned char* blk, unsigned char *mask);
 
 
-void masking (int pos_x, int pos_y, unsigned char* player, unsigned char * block);
+extern void set_palette(unsigned char k, unsigned char red, unsigned char green, unsigned char blue);
+
+
+extern void mask_text(int pos_x, int pos_y, unsigned char * mask);
+
+extern void reset_text(int pos_x, int pos_y, unsigned char * mask);
+
+extern void show_bar(char *input);
+
+
 
 #endif /* MODEX_H */

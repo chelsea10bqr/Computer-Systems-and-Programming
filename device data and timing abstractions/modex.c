@@ -37,12 +37,13 @@
  *            on other VirtualPC->QEMU migration changes.
  */
 
-#include <fcntl.h>
-#include <stdio.h>
-#include <string.h>
-#include <sys/io.h>
-#include <sys/mman.h>
-#include <unistd.h>
+ #include <fcntl.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/io.h>
+ #include <sys/mman.h>
+ #include <unistd.h>
 
 #include "blocks.h"
 #include "modex.h"
@@ -79,7 +80,14 @@
 #define NUM_GRAPHICS_REGS       9
 #define NUM_ATTR_REGS           22
 
-#define OFFSET    0x05A0   /* offset for the status bar*/
+#define TEXT_OFFSETX        46  /* the text space x above it */
+#define TEXT_OFFSETY        28 /* the text space y above it */
+#define COLOR_TRANS_OFFSET      64
+
+
+
+
+
 
 /* VGA register settings for mode X */
 static unsigned short mode_X_seq[NUM_SEQUENCER_REGS] = {
@@ -94,13 +102,13 @@ static unsigned short mode_X_CRTC[NUM_CRTC_REGS] = {
     0x6B18
 };
 
-/* change 2 registers for panning mode for status bar */
+
 static unsigned char mode_X_attr[NUM_ATTR_REGS * 2] = {
     0x00, 0x00, 0x01, 0x01, 0x02, 0x02, 0x03, 0x03,
     0x04, 0x04, 0x05, 0x05, 0x06, 0x06, 0x07, 0x07,
     0x08, 0x08, 0x09, 0x09, 0x0A, 0x0A, 0x0B, 0x0B,
     0x0C, 0x0C, 0x0D, 0x0D, 0x0E, 0x0E, 0x0F, 0x0F,
-    0x10, 0x61, 0x11, 0x00, 0x12, 0x0F, 0x13, 0x00,
+    0x10, 0x41, 0x11, 0x00, 0x12, 0x0F, 0x13, 0x00,
     0x14, 0x00, 0x15, 0x00
 };
 
@@ -145,6 +153,9 @@ static void write_font_data();
 static void set_text_mode_3(int clear_scr);
 static void copy_image(unsigned char* img, unsigned short scr_addr);
 static void bar_copy(unsigned char* img, unsigned short scr_addr);
+extern void set_palette(unsigned char k, unsigned char red, unsigned char green, unsigned char blue);
+extern void mask_text(int pos_x, int pos_y, unsigned char * mask);
+extern void reset_text(int pos_x, int pos_y, unsigned char * mask);
 
 /*
  * Images are built in this buffer, then copied to the video memory.
@@ -178,6 +189,8 @@ static void bar_copy(unsigned char* img, unsigned short scr_addr);
 #define MEM_FENCE_WIDTH 0
 #endif
 #define MEM_FENCE_MAGIC 0xF3
+
+static unsigned char bar[STATUS_BAR_SIZE]; // buffer used to store status bar image
 
 static unsigned char build[BUILD_BUF_SIZE + 2 * MEM_FENCE_WIDTH];
 static int img3_off;                /* offset of upper left pixel   */
@@ -309,7 +322,7 @@ int set_mode_X(void (*horiz_fill_fn)(int, int, unsigned char[SCROLL_X_DIM]),
     }
 
     /* One display page goes at the start of video memory. */
-    target_img = OFFSET;
+    target_img = STATUS_BAR_SIZE;
 
     /* Map video memory and obtain permission for VGA port access. */
     if (open_memory_and_ports() == -1)
@@ -527,31 +540,29 @@ void show_screen() {
 }
 
 /*
- * add_bar
+ * show_bar
  *   DESCRIPTION: add the status bar to the game
- *   INPUTS: the pointer to the input string
-              time: the time past
-              level: current map of the game
-              fruit: left fruits
-              color_buffer: the buffer for color value
-              color_bg: backgroud of statusbar
-              color_text:the text of statusbar
+ *   INPUTS: char* input : the pointer to the string
  *   OUTPUTS: none
  *   RETURN VALUE: none
  *   SIDE EFFECTS: copies from the build buffer to video memory;
                   use update_status to change the value in status bar
  *                 shifts the VGA display source to point to the new image
  */
-void add_bar(int time, int level, int fruit, unsigned char* color_buffer, unsigned char color_bg, unsigned char color_text) {
-    int i; /*loop index*/
 
-    update_status(time, level, fruit, color_buffer, color_bg, color_text);
-    for(i=0;i<4;i++)
-    {
-      SET_WRITE_MASK(1<<(i+8));
-      bar_copy(color_buffer+i*1440,(unsigned short)(0x00));
-    }
-}
+
+ void show_bar(char *input)
+ {
+     int i; /* loop index over video planes        */
+     show_status(bar, input); /* call this function to generate status bar*/
+     /* Draw to each plane in the video memory. */
+     for (i = 0; i < 4; i++)
+     {
+         SET_WRITE_MASK(1 << (i + 8));
+         bar_copy(bar + i * STATUS_BAR_SIZE, (unsigned short)(0x00));
+     }
+ }
+
 
 
 
@@ -571,6 +582,237 @@ void clear_screens() {
     memset(mem_image, 0, MODE_X_MEM_SIZE);
 }
 
+
+/*
+ * mask_text
+ *   DESCRIPTION: make the pixel for text be transparent
+ *   INPUTS: (pos_x,pos_y) -- coordinates of upper left corner of player
+ *           mask -- pointer to the mask storing transparent texts
+ *   OUTPUTS: none
+ *   RETURN VALUE: none
+ *   SIDE EFFECTS: store the text value in the buffer
+ */
+void mask_text(int pos_x, int pos_y, unsigned char * mask)
+{
+    int dx, dy;          /* loop indices for x and y traversal of block */
+    int x_left, x_right; /* clipping limits in horizontal dimension     */
+    unsigned char *temp = mask;
+
+
+    pos_y -= TEXT_OFFSETY;
+    pos_x -= TEXT_OFFSETX;
+
+     /* check the border*/
+    while (pos_y - show_y <= 0)
+    {
+      pos_y++;
+    }
+
+    /* Clip any pixels falling off the left side of screen. */
+    if ((x_left = show_x - pos_x) < 0)
+        x_left = 0;
+    /* Clip any pixels falling off the right side of screen. */
+    if ((x_right = show_x + SCROLL_X_DIM - pos_x) > X_TEXT)
+        x_right = X_TEXT;
+    /* Skip the first x_left pixels in both screen position and block data. */
+    pos_x += x_left;
+    temp += x_left;
+
+    /*
+     * Adjust x_right to hold the number of pixels to be drawn, and x_left
+     * to hold the amount to skip between rows in the block, which is the
+     * sum of the original left clip and (BLOCK_X_DIM - the original right
+     * clip).
+     */
+    x_right -= x_left;
+    x_left = X_TEXT - x_right;
+
+    int temp_x = pos_x;
+    int temp_y = pos_y;
+    /* mask the value*/
+    for (dy = 0; dy < FONT_HEIGHT; dy++, temp_y++) {
+        for (dx = 0; dx < x_right; dx++, temp_x++, temp++)
+        {
+          if (*temp == 0x01)
+          {
+            *(img3 + (temp_x >> 2) + temp_y * SCROLL_X_WIDTH +
+            (3 - (temp_x & 3)) * SCROLL_SIZE) += COLOR_TRANS_OFFSET;
+          }
+        }
+        temp_x -= x_right;
+        temp += x_left;
+    }
+}
+
+/*
+ * reset_text
+ *   DESCRIPTION: restore the original pixel
+ *   INPUTS: (pos_x,pos_y) -- coordinates of upper left corner of player
+ *           mask -- pointer to the mask storing transparent texts
+ *   OUTPUTS: none
+ *   RETURN VALUE: none
+ *   SIDE EFFECTS: reset text value
+ */
+void reset_text(int pos_x, int pos_y, unsigned char * mask)
+{
+  int dx, dy;          /* loop indices for x and y traversal of block */
+  int x_left, x_right; /* clipping limits in horizontal dimension     */
+  unsigned char *temp = mask;
+
+
+  pos_y -= TEXT_OFFSETY;
+  pos_x -= TEXT_OFFSETX;
+
+  /*check the border*/
+  while (pos_y - show_y <= 0)
+  {
+    pos_y++;
+  }
+
+  /* Clip any pixels falling off the left side of screen. */
+  if ((x_left = show_x - pos_x) < 0)
+      x_left = 0;
+  /* Clip any pixels falling off the right side of screen. */
+  if ((x_right = show_x + SCROLL_X_DIM - pos_x) > X_TEXT)
+      x_right = X_TEXT;
+  /* Skip the first x_left pixels in both screen position and block data. */
+  pos_x += x_left;
+  temp += x_left;
+
+  /*
+   * Adjust x_right to hold the number of pixels to be drawn, and x_left
+   * to hold the amount to skip between rows in the block, which is the
+   * sum of the original left clip and (BLOCK_X_DIM - the original right
+   * clip).
+   */
+  x_right -= x_left;
+  x_left = X_TEXT - x_right;
+
+  int temp_x = pos_x;
+  int temp_y = pos_y;
+
+  /*traverse the buffer*/
+
+  for (dy = 0; dy < FONT_HEIGHT; dy++, temp_y++) {
+      for (dx = 0; dx < x_right; dx++, temp_x++, temp++)
+      {
+        if (*temp == 0x01)
+        {
+          *(img3 + (temp_x >> 2) + temp_y * SCROLL_X_WIDTH +
+          (3 - (temp_x & 3)) * SCROLL_SIZE) -= COLOR_TRANS_OFFSET;
+        }
+      }
+      temp_x -= x_right;
+      temp += x_left;
+  }
+}
+
+/*
+ * get_full_block
+ *   DESCRIPTION: copy the block to buffer
+ *   INPUTS: (pos_x,pos_y) -- coordinates of upper left corner of block
+ *           blk -- the pointer for the buffer
+ *   OUTPUTS: none
+ *   RETURN VALUE: none
+ *   SIDE EFFECTS: copy image from build buffer
+ */
+void get_full_block(int pos_x, int pos_y, unsigned char *blk)
+{
+    int dx, dy;          /* loop indices for x and y traversal of block */
+
+    /* If block is completely off-screen, we do nothing. */
+    if (pos_x + BLOCK_X_DIM <= show_x || pos_x >= show_x + SCROLL_X_DIM ||
+        pos_y + BLOCK_Y_DIM <= show_y || pos_y >= show_y + SCROLL_Y_DIM)
+        return;
+
+    unsigned char *temp = blk; /*traverse the buffer */
+
+    int temp_x = pos_x;
+    int temp_y = pos_y;
+    for (dy = 0; dy < BLOCK_Y_DIM; dy++, temp_y++) {
+        for (dx = 0; dx < BLOCK_X_DIM; dx++, temp_x++, temp++)
+        {
+            *temp = *(img3 + (temp_x >> 2) + temp_y * SCROLL_X_WIDTH +
+            (3 - (temp_x & 3)) * SCROLL_SIZE);
+        }
+        temp_x = pos_x;
+    }
+}
+
+/*
+ * draw_mask
+ *   DESCRIPTION: Draw a BLOCK_X_DIM x BLOCK_Y_DIM block at absolute
+ *                coordinates.  Mask any portion of the block not inside
+ *                the logical view window.
+ *   INPUTS: (pos_x,pos_y) -- coordinates of upper left corner of block
+ *           blk -- image data for block
+ *           mask -- whether transparent
+ *   OUTPUTS: none
+ *   RETURN VALUE: none
+ *   SIDE EFFECTS: draws into the build buffer
+ */
+void draw_mask(int pos_x, int pos_y, unsigned char* blk, unsigned char *mask)
+{
+    int dx, dy;          /* loop indices for x and y traversal of block */
+    int x_left, x_right; /* clipping limits in horizontal dimension     */
+    int y_top, y_bottom; /* clipping limits in vertical dimension       */
+
+    /* If block is completely off-screen, we do nothing. */
+    if (pos_x + BLOCK_X_DIM <= show_x || pos_x >= show_x + SCROLL_X_DIM ||
+        pos_y + BLOCK_Y_DIM <= show_y || pos_y >= show_y + SCROLL_Y_DIM)
+        return;
+
+    /* Clip any pixels falling off the left side of screen. */
+    if ((x_left = show_x - pos_x) < 0)
+        x_left = 0;
+    /* Clip any pixels falling off the right side of screen. */
+    if ((x_right = show_x + SCROLL_X_DIM - pos_x) > BLOCK_X_DIM)
+        x_right = BLOCK_X_DIM;
+    /* Skip the first x_left pixels in both screen position, block data and mask data. */
+    pos_x += x_left;
+    blk += x_left;
+    mask += x_left;
+
+    /*
+     * Adjust x_right to hold the number of pixels to be drawn, and x_left
+     * to hold the amount to skip between rows in the block, which is the
+     * sum of the original left clip and (BLOCK_X_DIM - the original right
+     * clip).
+     */
+    x_right -= x_left;
+    x_left = BLOCK_X_DIM - x_right;
+
+    /* Clip any pixels falling off the top of the screen. */
+    if ((y_top = show_y - pos_y) < 0)
+        y_top = 0;
+    /* Clip any pixels falling off the bottom of the screen. */
+    if ((y_bottom = show_y + SCROLL_Y_DIM - pos_y) > BLOCK_Y_DIM)
+        y_bottom = BLOCK_Y_DIM;
+    /*
+     * Skip the first y_left pixel in screen position and the first
+     * y_left rows of pixels in the block data and mask data.
+     */
+    pos_y += y_top;
+    blk += y_top * BLOCK_X_DIM;
+    mask += y_top * BLOCK_X_DIM;
+    /* Adjust y_bottom to hold the number of pixel rows to be drawn. */
+    y_bottom -= y_top;
+
+    /* Draw the clipped image. */
+    for (dy = 0; dy < y_bottom; dy++, pos_y++) {
+        for (dx = 0; dx < x_right; dx++, pos_x++, blk++, mask++)
+        {
+          if (*mask == 0) // only draw transparent pixels
+          {
+            *(img3 + (pos_x >> 2) + pos_y * SCROLL_X_WIDTH +
+            (3 - (pos_x & 3)) * SCROLL_SIZE) = *blk;
+          }
+        }
+        pos_x -= x_right;
+        blk += x_left;
+        mask += x_left;
+    }
+}
 /*
  * draw_full_block
  *   DESCRIPTION: Draw a BLOCK_X_DIM x BLOCK_Y_DIM block at absolute
@@ -637,81 +879,8 @@ void draw_full_block(int pos_x, int pos_y, unsigned char* blk) {
     }
 }
 
-/*
- * masking
- *   DESCRIPTION: mask the trace of the player when they move.save the previous value and restore it
- *   INPUTS: (pos_x,pos_y) -- coordinates of upper left corner of block
-              player- the data for player
- *           block -- image data for block (one byte per pixel, as a C array
- *                  of dimensions [BLOCK_Y_DIM][BLOCK_X_DIM])
- *   OUTPUTS: none
- *   RETURN VALUE: none
- *   SIDE EFFECTS: draws into the build buffer
- */
-void masking (int pos_x, int pos_y, unsigned char* player, unsigned char * block)
-{
-    int dx, dy;          /* loop indices for x and y traversal of block */
-    int x_left, x_right; /* clipping limits in horizontal dimension     */
-    int y_top, y_bottom; /* clipping limits in vertical dimension       */
-
-    /* the block be saved*/
-    unsigned char * b = mask_image;
-
-    /* check whether in the screen*/
-    if (pos_x + BLOCK_X_DIM <= show_x || pos_x >= show_x + SCROLL_X_DIM ||
-        pos_y + BLOCK_Y_DIM <= show_y || pos_y >= show_y + SCROLL_Y_DIM)
-  return;
 
 
-    if ((x_left = show_x - pos_x) < 0)   /* check the left side and right side of screen*/
-        x_left = 0;
-
-    if ((x_right = show_x + SCROLL_X_DIM - pos_x) > BLOCK_X_DIM)
-        x_right = BLOCK_X_DIM;
-
-    pos_x += x_left;
-    block += x_left;
-
-
-    x_right -= x_left;  /*hold the value which need to be drawn*/
-    x_left = BLOCK_X_DIM - x_right;
-
-    if ((y_top = show_y - pos_y) < 0)   /* check the top and the bottom of screen */
-        y_top = 0;
-
-    if ((y_bottom = show_y + SCROLL_Y_DIM - pos_y) > BLOCK_Y_DIM)
-        y_bottom = BLOCK_Y_DIM;
-
-    pos_y += y_top;
-    block += y_top * BLOCK_X_DIM;
-
-    y_bottom -= y_top;
-
-    /* draw the image*/
-    for (dy = 0; dy < y_bottom; dy++, pos_y++)
-    {
-      for (dx = 0; dx < x_right; dx++, pos_x++, block++)
-      {
-           /*store the value*/
-          *b = *(img3 + (pos_x >> 2) + pos_y * SCROLL_X_WIDTH + (3 - (pos_x & 3)) * SCROLL_SIZE);
-
-
-          if(* player == 1)
-          {
-            *(img3 + (pos_x >> 2) + pos_y * SCROLL_X_WIDTH + (3 - (pos_x & 3)) * SCROLL_SIZE) = *block;
-          }
-
-
-          b++;   /*update the index*/
-          player++;
-      }
-          b += x_left;/* move to the next pixel*/
-          player += x_left;
-
-          pos_x -= x_right;
-          block += x_left;
-    }
-}
 
 /*
  * The functions inside the preprocessor block below rely on functions
@@ -967,18 +1136,27 @@ static void set_graphics_registers(unsigned short table[NUM_GRAPHICS_REGS]) {
     REP_OUTSW(0x03CE, table, NUM_GRAPHICS_REGS);
 }
 
+
+void set_palette(unsigned char k, unsigned char red, unsigned char green, unsigned char blue)
+{
+    OUTB(0x03C8, k);
+    OUTB(0x03C9, red);
+    OUTB(0x03C9, green);
+    OUTB(0x03C9, blue);
+}
+
 /*
  * fill_palette
  *   DESCRIPTION: Fill VGA palette with necessary colors for the maze game.
- *                Only the first 64 (of 256) colors are written.
+ *                Only the first 128 (of 256) colors are written.
  *   INPUTS: none
  *   OUTPUTS: none
  *   RETURN VALUE: none
- *   SIDE EFFECTS: changes the first 64 palette colors
+ *   SIDE EFFECTS: changes the first 128 palette colors
  */
 static void fill_palette() {
     /* 6-bit RGB (red, green, blue) values for first 64 colors */
-    static unsigned char palette_RGB[64][3] = {
+    static unsigned char palette_RGB[128][3] = {
         { 0x00, 0x00, 0x00 },{ 0x00, 0x00, 0x2A },   /* palette 0x00 - 0x0F    */
         { 0x00, 0x2A, 0x00 },{ 0x00, 0x2A, 0x2A },   /* basic VGA colors       */
         { 0x2A, 0x00, 0x00 },{ 0x2A, 0x00, 0x2A },
@@ -1010,6 +1188,38 @@ static void fill_palette() {
         { 0x20, 0x18, 0x10 },{ 0x28, 0x1C, 0x10 },
         { 0x3F, 0x20, 0x10 },{ 0x38, 0x24, 0x10 },
         { 0x3F, 0x28, 0x10 },{ 0x3F, 0x2C, 0x10 },
+        { 0x3F, 0x30, 0x10 },{ 0x3F, 0x20, 0x10 },
+        { 0x00, 0x00, 0x00 },{ 0x00, 0x00, 0x2A },   /* palette 0x40 - 0x4F    */
+        { 0x00, 0x2A, 0x00 },{ 0x00, 0x2A, 0x2A },   /* basic VGA colors       */
+        { 0x2A, 0x00, 0x00 },{ 0x2A, 0x00, 0x2A },
+        { 0x2A, 0x15, 0x00 },{ 0x2A, 0x2A, 0x2A },
+        { 0x15, 0x15, 0x15 },{ 0x15, 0x15, 0x3F },
+        { 0x15, 0x3F, 0x15 },{ 0x15, 0x3F, 0x3F },
+        { 0x3F, 0x15, 0x15 },{ 0x3F, 0x15, 0x3F },
+        { 0x3F, 0x3F, 0x15 },{ 0x3F, 0x3F, 0x3F },
+        { 0x00, 0x00, 0x00 },{ 0x05, 0x05, 0x05 },   /* palette 0x50 - 0x5F    */
+        { 0x08, 0x08, 0x08 },{ 0x0B, 0x0B, 0x0B },   /* VGA grey scale         */
+        { 0x0E, 0x0E, 0x0E },{ 0x11, 0x11, 0x11 },
+        { 0x14, 0x14, 0x14 },{ 0x18, 0x18, 0x18 },
+        { 0x1C, 0x1C, 0x1C },{ 0x20, 0x20, 0x20 },
+        { 0x24, 0x24, 0x24 },{ 0x28, 0x28, 0x28 },
+        { 0x2D, 0x2D, 0x2D },{ 0x32, 0x32, 0x32 },
+        { 0x38, 0x38, 0x38 },{ 0x3F, 0x3F, 0x3F },
+        { 0x3F, 0x3F, 0x3F },{ 0x3F, 0x3F, 0x3F },   /* palette 0x60 - 0x6F    */
+        { 0x00, 0x00, 0x3F },{ 0x00, 0x00, 0x00 },   /* wall and player colors */
+        { 0x00, 0x00, 0x00 },{ 0x00, 0x00, 0x00 },
+        { 0x00, 0x00, 0x00 },{ 0x00, 0x00, 0x00 },
+        { 0x00, 0x00, 0x00 },{ 0x00, 0x00, 0x00 },
+        { 0x00, 0x00, 0x00 },{ 0x00, 0x00, 0x00 },
+        { 0x00, 0x00, 0x00 },{ 0x00, 0x00, 0x00 },
+        { 0x00, 0x00, 0x00 },{ 0x00, 0x00, 0x00 },
+        { 0x10, 0x08, 0x00 },{ 0x18, 0x0C, 0x00 },   /* palette 0x70 - 0x7F    */
+        { 0x20, 0x10, 0x00 },{ 0x28, 0x14, 0x00 },   /* browns for maze floor  */
+        { 0x30, 0x18, 0x00 },{ 0x38, 0x1C, 0x00 },
+        { 0x3F, 0x20, 0x00 },{ 0x3F, 0x20, 0x10 },
+        { 0x20, 0x18, 0x10 },{ 0x28, 0x1C, 0x10 },
+        { 0x3F, 0x20, 0x10 },{ 0x38, 0x24, 0x10 },
+        { 0x3F, 0x28, 0x10 },{ 0x3F, 0x2C, 0x10 },
         { 0x3F, 0x30, 0x10 },{ 0x3F, 0x20, 0x10 }
     };
 
@@ -1017,8 +1227,15 @@ static void fill_palette() {
     OUTB(0x03C8, 0x00);
 
     /* Write all 64 colors from array. */
-    REP_OUTSB(0x03C9, palette_RGB, 64 * 3);
+    REP_OUTSB(0x03C9, palette_RGB, 128 * 3);
+   /* for transparent text*/
+    int i;
+    for (i = 64; i < 127; i++)
+    {
+      set_palette(i, (palette_RGB[i][0] + 0x3F)/2, (palette_RGB[i][1] + 0x3F)/2, (palette_RGB[i][2] + 0x3F)/2);
+    }
 }
+
 
 /*
  * write_font_data
@@ -1132,6 +1349,7 @@ static void bar_copy(unsigned char* img, unsigned short scr_addr) {
      * implemented using ISA-specific features like those below,
      * but the code here provides an example of x86 string moves
      */
+     /* 16000-14560  = 1440 for status bar*/
     asm volatile ("                                             \n\
         cld                                                     \n\
         movl $1440,%%ecx                                       \n\

@@ -40,6 +40,7 @@
 #include "maze.h"
 #include "modex.h"
 #include "text.h"
+#include "module/tuxctl-ioctl.h"
 
 // New Includes and Defines
 #include <linux/rtc.h>
@@ -59,6 +60,13 @@
 #define RIGHT     67
 #define LEFT      68
 
+#define TUX_UP    239  /* for tux instruction*/
+#define TUX_LEFT  191
+#define TUX_DOWN  223
+#define TUX_RIGHT 127
+
+
+
 /*
  * If NDEBUG is not defined, we execute sanity checks to make sure that
  * changes to enumerations, bit maps, etc., have been made consistently.
@@ -73,10 +81,15 @@ static int sanity_check();
 /* a few constants */
 #define PAN_BORDER      5  /* pan when border in maze squares reaches 5    */
 #define MAX_LEVEL       10 /* maximum level number                         */
-#define NUM_PIXELS     (320*18)
+
 
 /* outcome of each level, and of the game as a whole */
 typedef enum {GAME_WON, GAME_LOST, GAME_QUIT} game_condition_t;
+
+
+
+
+
 
 /* structure used to hold game information */
 typedef struct {
@@ -103,6 +116,12 @@ static void move_left(int* xpos);
 static int unveil_around_player(int play_x, int play_y);
 static void *rtc_thread(void *arg);
 static void *keyboard_thread(void *arg);
+static void *tux_thread(void *arg);
+static void fruit_text(char *fruit_tex, int f_num);
+static void set_led(int minutes, int seconds);
+
+int f_num = 0;
+char* fruit_texts[7] = {"an apple!", "ew, grapes", "eh, it's a peach", "a strawberry", "A BANANA!", "melonwater", "Uh...Dew?"};
 
 /*
  * prepare_maze_level
@@ -270,7 +289,7 @@ static int unveil_around_player(int play_x, int play_y) {
     int i, j;            /* loop indices for unveiling maze squares */
 
     /* Check for fruit at the player's position. */
-    (void)check_for_fruit (x, y);
+    f_num = check_for_fruit (x, y);
 
     /* Unveil spaces around the player. */
     for (i = -1; i < 2; i++)
@@ -314,10 +333,13 @@ int winner= 0;
 int next_dir = UP;
 int play_x, play_y, last_dir, dir;
 int move_cnt = 0;
-int fd;
+int fd, tux;
+int buttons_pressed = 0;
+unsigned long buttons;
 unsigned long data;
 static struct termios tio_orig;
 static pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  cv = PTHREAD_COND_INITIALIZER;
 
 /*
  * keyboard_thread
@@ -375,6 +397,43 @@ static void *keyboard_thread(void *arg) {
     return 0;
 }
 
+/*
+ * tux_thread
+ *   DESCRIPTION: Thread that handles tux controller inputs
+ *   INPUTS: none
+ *   OUTPUTS: none
+ *   RETURN VALUE: none
+ *   SIDE EFFECTS: none
+ */
+static void *tux_thread(void *arg) {
+    while (winner == 0) {
+        pthread_mutex_lock(&mtx);
+        while(!buttons_pressed)
+        {
+            pthread_cond_wait(&cv, &mtx);
+        }
+
+        buttons_pressed = 0;
+
+        switch(buttons) {
+            case TUX_UP:
+                next_dir = DIR_UP;
+                break;
+            case TUX_DOWN:
+                next_dir = DIR_DOWN;
+                break;
+            case TUX_RIGHT:
+                next_dir = DIR_RIGHT;
+                break;
+            case TUX_LEFT:
+                next_dir = DIR_LEFT;
+                break;
+        }
+        pthread_mutex_unlock(&mtx);
+    }
+    return NULL;
+}
+
 /* some stats about how often we take longer than a single timer tick */
 static int goodcount = 0;
 static int badcount = 0;
@@ -389,177 +448,284 @@ static int total = 0;
  *   SIDE EFFECTS: none
  */
 static void *rtc_thread(void *arg) {
-    int ticks = 0;
-    int level;
-    int ret;
-    int open[NUM_DIRS];
-    int need_redraw = 0;
-    int goto_next_level = 0;
-    int last_y;  /*previews location and the time constants for use*/
-    int last_x;
-    time_t start;
-    time_t current;
-    start = time(0);
-    unsigned char color_buff[NUM_PIXELS];
+  static unsigned char caption[16*8*16];
+  int ticks = 0;
+  int level;
+  int ret;
+  int open[NUM_DIRS];
+  int need_redraw = 0;
+  int goto_next_level = 0;
+  unsigned char ground[BLOCK_X_DIM*BLOCK_Y_DIM];
+  int prev_x, prev_y; /* previous location for player*/
+  int prevt_x, prevt_y; /* the previous location for text*/
+  int old_n_fruit; /* store the old fruits number*/
 
-    // Loop over levels until a level is lost or quit.
-    for (level = 1; (level <= MAX_LEVEL) && (quit_flag == 0); level++) {
-        // Prepare for the level.  If we fail, just let the player win.
-        if (prepare_maze_level(level) != 0)
-            break;
-        goto_next_level = 0;
+  int red_option[MAX_LEVEL] = {0x3F, 0x00, 0x00, 0x3F, 0x00, 0x3F, 0x0F, 0x00, 0x00, 0x0F};
+  int blue_option[MAX_LEVEL] = {0x00, 0x3F, 0x00, 0x00, 0x3F, 0x3F, 0x00, 0x0F, 0x00, 0x0F};
+  int green_option[MAX_LEVEL] = {0x00, 0x00, 0x3F, 0x3F, 0x3F, 0x00, 0x00, 0x00, 0x0F, 0x00};
 
-        // Start the player at (1,1)
-        play_x = BLOCK_X_DIM;
-        play_y = BLOCK_Y_DIM;
+  int red_wall[MAX_LEVEL] = {0x22, 0x00, 0x00, 0x11, 0x22, 0x00, 0x11, 0x00, 0x00, 0x22};
+  int blue_wall[MAX_LEVEL] = {0x00, 0x22, 0x00, 0x22, 0x00, 0x22, 0x00, 0x22, 0x00, 0x22};
+  int green_wall[MAX_LEVEL] = {0x00, 0x00, 0x22, 0x00, 0x33, 0x00, 0x00, 0x33, 0x33, 0x00};
 
-        last_x = play_x;  /* sotre the value of location*/
-        last_y = play_y;
+  // Loop over levels until a level is lost or quit.
+  for (level = 1; (level <= MAX_LEVEL) && (quit_flag == 0); level++) {
+      // Prepare for the level.  If we fail, just let the player win.
+      if (prepare_maze_level(level) != 0)
+          break;
+      goto_next_level = 0;
 
-        // move_cnt tracks moves remaining between maze squares.
-        // When not moving, it should be 0.
-        move_cnt = 0;
+      // Start the player at (1,1)
+      play_x = BLOCK_X_DIM;
+      play_y = BLOCK_Y_DIM;
 
-        // Initialize last direction moved to up
-        last_dir = DIR_UP;
+      time_t level_time = time(NULL); // keep track of start time
+      time_t trans;
+      int trans_flag = 0;
 
-        // Initialize the current direction of motion to stopped
-        dir = DIR_STOP;
-        next_dir = DIR_STOP;
+      /* change the color of status bar*/
+      set_palette(BAR_COLOR,red_option[level-1],green_option[level-1],blue_option[level-1]);
 
-        // Show maze around the player's original position
-        (void)unveil_around_player(play_x, play_y);
-        masking (play_x, play_y, get_player_mask(last_dir), get_player_block(last_dir));
-        show_screen();                           /* save and mask then restore it */
-        draw_full_block(last_x, last_y, mask_image);
+      /* the wall color*/
+      set_palette(0x22,red_wall[level-1],green_wall[level-1],blue_wall[level-1]);
 
-        // get first Periodic Interrupt
-        ret = read(fd, &data, sizeof(unsigned long));
+      // move_cnt tracks moves remaining between maze squares.
+      // When not moving, it should be 0.
+      move_cnt = 0;
 
-        time(&start);
+      // Initialize last direction moved to up
+      last_dir = DIR_UP;
 
-        while ((quit_flag == 0) && (goto_next_level == 0)) {
-            // Wait for Periodic Interrupt
-            ret = read(fd, &data, sizeof(unsigned long));
+      // Initialize the current direction of motion to stopped
+      dir = DIR_STOP;
+      next_dir = DIR_STOP;
 
-            // Update tick to keep track of time.  If we missed some
-            // interrupts we want to update the player multiple times so
-            // that player velocity is smooth
-            int num_r;
-            int time_past;
+      old_n_fruit = num_fruit(); // update fruite number
 
-            num_r = fruit_num();
+      // Show maze around the player's original position
+      (void)unveil_around_player(play_x, play_y);
 
-            time(&current);
+      get_full_block(play_x, play_y, ground);
+      prev_x = play_x;
+      prev_y = play_y;
+      draw_full_block(play_x, play_y, get_player_block(last_dir)); /* draw the player*/
+      draw_mask(play_x, play_y, ground, get_player_mask(last_dir)); /* for masking*/
+      show_screen();
 
-            time_past = (int)difftime(current,start);
+      // get first Periodic Interrupt
+      ret = read(fd, &data, sizeof(unsigned long));
 
-            add_bar(time_past, level, num_r,color_buff,0x01,0xF);
-            ticks = data >> 8;
+      while ((quit_flag == 0) && (goto_next_level == 0)) {
+          // Wait for Periodic Interrupt
+          ret = read(fd, &data, sizeof(unsigned long));
 
-            total += ticks;
+          // Update tick to keep track of time.  If we missed some
+          // interrupts we want to update the player multiple times so
+          // that player velocity is smooth
+          ticks = data >> 8;
 
-            // If the system is completely overwhelmed we better slow down:
-            if (ticks > 8) ticks = 8;
+          total += ticks;
 
-            if (ticks > 1) {
-                badcount++;
-            }
-            else {
-                goodcount++;
-            }
+          // If the system is completely overwhelmed we better slow down:
+          if (ticks > 8) ticks = 8;
 
-            while (ticks--) {
+          if (ticks > 1) {
+              badcount++;
+          }
+          else {
+              goodcount++;
+          }
 
-                // Lock the mutex
-                pthread_mutex_lock(&mtx);
+          while (ticks--) {
 
-                // Check to see if a key has been pressed
-                if (next_dir != dir) {
-                    // Check if new direction is backwards...if so, do immediately
-                    if ((dir == DIR_UP && next_dir == DIR_DOWN) ||
-                        (dir == DIR_DOWN && next_dir == DIR_UP) ||
-                        (dir == DIR_LEFT && next_dir == DIR_RIGHT) ||
-                        (dir == DIR_RIGHT && next_dir == DIR_LEFT)) {
-                        if (move_cnt > 0) {
-                            if (dir == DIR_UP || dir == DIR_DOWN)
-                                move_cnt = BLOCK_Y_DIM - move_cnt;
-                            else
-                                move_cnt = BLOCK_X_DIM - move_cnt;
-                        }
-                        dir = next_dir;
-                    }
-                }
-                // New Maze Square!
-                if (move_cnt == 0) {
-                    // The player has reached a new maze square; unveil nearby maze
-                    // squares and check whether the player has won the level.
-                    if (unveil_around_player(play_x, play_y)) {
-                        pthread_mutex_unlock(&mtx);
-                        goto_next_level = 1;
-                        break;
-                    }
+            /* setting for tux*/
+            ioctl(tux, TUX_BUTTONS, &buttons);
+            if (buttons == TUX_UP || buttons == TUX_LEFT || buttons == TUX_DOWN || buttons == TUX_RIGHT)
+              buttons_pressed = 1;
 
-                    // Record directions open to motion.
-                    find_open_directions (play_x / BLOCK_X_DIM, play_y / BLOCK_Y_DIM, open);
+            pthread_mutex_lock(&mtx);
+            if(buttons_pressed)
+              pthread_cond_signal(&cv);
+            pthread_mutex_unlock(&mtx);
 
-                    // Change dir to next_dir if next_dir is open
-                    if (open[next_dir]) {
-                        dir = next_dir;
-                    }
+            // Lock the mutex
+            pthread_mutex_lock(&mtx);
 
-                    // The direction may not be open to motion...
-                    //   1) ran into a wall
-                    //   2) initial direction and its opposite both face walls
-                    if (dir != DIR_STOP) {
-                        if (!open[dir]) {
-                            dir = DIR_STOP;
-                        }
-                        else if (dir == DIR_UP || dir == DIR_DOWN) {
-                            move_cnt = BLOCK_Y_DIM;
-                        }
-                        else {
-                            move_cnt = BLOCK_X_DIM;
-                        }
-                    }
-                }
-                // Unlock the mutex
-                pthread_mutex_unlock(&mtx);
-
-                if (dir != DIR_STOP) {
-                    // move in chosen direction
-                    last_dir = dir;
-                    move_cnt--;
-                    switch (dir) {
-                        case DIR_UP:
-                            move_up(&play_y);
-                            break;
-                        case DIR_RIGHT:
-                            move_right(&play_x);
-                            break;
-                        case DIR_DOWN:
-                            move_down(&play_y);
-                            break;
-                        case DIR_LEFT:
-                            move_left(&play_x);
-                            break;
-                    }
-                    need_redraw = 1;
+              // Check to see if a key has been pressed
+              if (next_dir != dir) {
+                  // Check if new direction is backwards...if so, do immediately
+                  if ((dir == DIR_UP && next_dir == DIR_DOWN) ||
+                      (dir == DIR_DOWN && next_dir == DIR_UP) ||
+                      (dir == DIR_LEFT && next_dir == DIR_RIGHT) ||
+                      (dir == DIR_RIGHT && next_dir == DIR_LEFT)) {
+                      if (move_cnt > 0) {
+                          if (dir == DIR_UP || dir == DIR_DOWN)
+                              move_cnt = BLOCK_Y_DIM - move_cnt;
+                          else
+                              move_cnt = BLOCK_X_DIM - move_cnt;
+                      }
+                      dir = next_dir;
                   }
-                }
-                /* go to next level*/
-                last_y = play_y;
-                last_x = play_x;
-
-                masking (play_x, play_y, get_player_mask(last_dir), get_player_block(last_dir));
-                show_screen();                /* save and mask then move to the next*/
-                draw_full_block (last_x, last_y, mask_image);  /* restoret the value we saved*/
-
-                need_redraw = 0;
               }
+              // New Maze Square!
+              if (move_cnt == 0) {
+                  // The player has reached a new maze square; unveil nearby maze
+                  // squares and check whether the player has won the level.
+                  if (unveil_around_player(play_x, play_y)) {
+                      pthread_mutex_unlock(&mtx);
+                      goto_next_level = 1;
+                      break;
+                  }
+                  if (old_n_fruit != num_fruit())
+                  {
+                    get_full_block(play_x, play_y, ground);
+                    prev_x = play_x;   /*update the location*/
+                    prev_y = play_y;
+                    draw_full_block(play_x, play_y, get_player_block(last_dir));
+                    draw_mask(play_x, play_y, ground, get_player_mask(last_dir));
+                    char fruit_tex[14];
+                    fruit_text(fruit_tex, f_num);
+                    text_draw(caption, fruit_tex);
+                    mask_text(play_x, play_y, caption);
+                    prevt_x = play_x;
+                    prevt_y = play_y;
+                    trans = time(NULL);
+                    trans_flag = 11;
+                    show_screen();
+                  }
+
+                  old_n_fruit = num_fruit();  /* update the fruit number*/
+
+                  /*glowing */
+                  time_t curr_t = time(NULL);
+                  unsigned char pr = curr_t%20 * 0x0A;
+                  unsigned char pg = curr_t%17 * 0x0A;
+                  unsigned char pb = curr_t%13 * 0x0A;
+
+                  set_palette(0x20, 0x3F - pr, 0x3F - pg, 0x3F - pb);
+
+                  // Record directions open to motion.
+                  find_open_directions (play_x / BLOCK_X_DIM, play_y / BLOCK_Y_DIM, open);
+
+                  // Change dir to next_dir if next_dir is open
+                  if (open[next_dir]) {
+                      dir = next_dir;
+                  }
+
+                  // The direction may not be open to motion...
+                  //   1) ran into a wall
+                  //   2) initial direction and its opposite both face walls
+                  if (dir != DIR_STOP) {
+                      if (!open[dir]) {
+                          dir = DIR_STOP;
+                      }
+                      else if (dir == DIR_UP || dir == DIR_DOWN) {
+                          move_cnt = BLOCK_Y_DIM;
+                      }
+                      else {
+                          move_cnt = BLOCK_X_DIM;
+                      }
+                  }
+              }
+              // Unlock the mutex
+              pthread_mutex_unlock(&mtx);
+
+              if (trans_flag == 11)
+              {
+                trans_flag = 10;
+                reset_text(prevt_x, prevt_y, caption);
+                time_t trans2 = time(NULL);
+                if (trans2 - trans >= 3)
+                  trans_flag = 0;
+              }
+
+              if (dir != DIR_STOP) {
+                  // move in chosen direction
+                  last_dir = dir;
+                  move_cnt--;
+                  switch (dir) {
+                      case DIR_UP:
+                          move_up(&play_y);
+                          break;
+                      case DIR_RIGHT:
+                          move_right(&play_x);
+                          break;
+                      case DIR_DOWN:
+                          move_down(&play_y);
+                          break;
+                      case DIR_LEFT:
+                          move_left(&play_x);
+                          break;
+                  }
+                  draw_full_block(prev_x, prev_y, ground);
+                  get_full_block(play_x, play_y, ground); /* restore the data*/
+                  prev_x = play_x;
+                  prev_y = play_y;
+                  draw_full_block(play_x, play_y, get_player_block(last_dir)); /* draw player*/
+                  draw_mask(play_x, play_y, ground, get_player_mask(last_dir));   /* masking*/
+                  need_redraw = 1;
+              }
+          }
+          if(trans_flag == 10)  /* remove the floating message*/
+          {
+            mask_text(play_x, play_y, caption);
+            prevt_x = play_x;
+            prevt_y = play_y;
+          }
+          if (need_redraw)
+          {
+              show_screen();
+          }
+
+          if (trans_flag == 10)
+          {
+            reset_text(prevt_x, prevt_y, caption);
+            time_t trans2 = time(NULL);
+            if (trans2 - trans >= 3)
+            {
+              trans_flag = 0;
+              show_screen();
             }
-            if (quit_flag == 0) winner = 1;
-            return 0;
+          }
+
+          /* for the status bar*/
+          char sta[40];
+          time_t curr_time = time(NULL);   /* get the time value*/
+          int diff = curr_time - level_time;
+          int minutes = diff/60;
+          int seconds = diff % 60;
+          set_led(minutes, seconds); /* set the led for tux*/
+
+          if (num_fruit() <= 1)
+          {
+            if (seconds >= 10 && minutes >= 10)
+              sprintf(sta, "Level %d     %d Fruit     %d:%d", game_info.number, num_fruit(), minutes, seconds);
+            else if (minutes >= 10)
+              sprintf(sta, "Level %d     %d Fruit     %d:0%d", game_info.number, num_fruit(), minutes, seconds);
+            else if (seconds >= 10)
+              sprintf(sta, "Level %d     %d Fruit     0%d:%d", game_info.number, num_fruit(), minutes, seconds);
+            else
+              sprintf(sta, "Level %d     %d Fruit     0%d:0%d", game_info.number, num_fruit(), minutes, seconds);
+          }
+          else
+          {
+            if (seconds >= 10 && minutes >= 10)
+              sprintf(sta, "Level %d     %d Fruits    %d:%d", game_info.number, num_fruit(), minutes, seconds);
+            else if (minutes >= 10)
+              sprintf(sta, "Level %d     %d Fruits    %d:0%d", game_info.number, num_fruit(), minutes, seconds);
+            else if (seconds >= 10)
+              sprintf(sta, "Level %d     %d Fruits    0%d:%d", game_info.number, num_fruit(), minutes, seconds);
+            else
+              sprintf(sta, "Level %d     %d Fruits    0%d:0%d", game_info.number, num_fruit(), minutes, seconds);
+          }
+          show_bar(sta); /* draw the status bar*/
+          need_redraw = 0;
+      }
+  }
+  if (quit_flag == 0)
+      winner = 1;
+
+  return 0;
 }
 
 /*
@@ -577,6 +743,7 @@ int main() {
 
     pthread_t tid1;
     pthread_t tid2;
+    pthread_t tid3;
 
     // Initialize RTC
     fd = open("/dev/rtc", O_RDONLY, 0);
@@ -586,6 +753,11 @@ int main() {
     ret = ioctl(fd, RTC_IRQP_SET, update_rate);
     ret = ioctl(fd, RTC_PIE_ON, 0);
 
+    /* turn the tux on*/
+    int ldisc_num = N_MOUSE;
+    tux = open("/dev/ttyS0", O_RDWR | O_NOCTTY);
+    ioctl (tux, TIOCSETD, &ldisc_num);
+    ioctl (tux, TUX_INIT);
     // Initialize Keyboard
     // Turn on non-blocking mode
     if (fcntl(fileno(stdin), F_SETFL, O_NONBLOCK) != 0) {
@@ -618,10 +790,12 @@ int main() {
     // Create the threads
     pthread_create(&tid1, NULL, rtc_thread, NULL);
     pthread_create(&tid2, NULL, keyboard_thread, NULL);
+    pthread_create(&tid3, NULL, tux_thread, NULL);
 
     // Wait for all the threads to end
     pthread_join(tid1, NULL);
     pthread_join(tid2, NULL);
+    pthread_cancel(tid3);
 
     // Shutdown Display
     clear_mode_X();
@@ -631,6 +805,8 @@ int main() {
 
     // Close RTC
     close(fd);
+
+    close(tux);   /* close the tux*/
 
     // Print outcome of the game
     if (winner == 1) {
@@ -645,4 +821,49 @@ int main() {
 
     // Return success
     return 0;
+}
+
+/*
+ * fruit_text
+ *   DESCRIPTION: generate floating message
+ *   INPUTS: fruit_tex: pointer to the string
+            f_num: the left number of fruit
+ *   OUTPUTS: NONE
+ *   RETURN VALUE: NONE
+ *   SIDE EFFECTS: show floating message
+ */
+
+static void fruit_text(char *fruit_tex, int f_num)
+{
+  int fruit_identifier = 0;
+  fruit_identifier = f_num-1;
+  sprintf(fruit_tex,fruit_texts[fruit_identifier]);
+
+}
+
+/*
+ * set_led
+ *   DESCRIPTION: set the time for tux
+ *   INPUTS: minutes: 2bit
+             seconds: 2bit
+ *   OUTPUTS:
+ *   RETURN VALUE: NONE
+ *   SIDE EFFECTS: let the tux display the time
+ */
+static void set_led(int minutes, int seconds)
+{
+    int fourth = minutes / 10;   /*for the time */
+    int thrid = minutes % 10;
+    int second = seconds / 10;
+    int first = seconds % 10;
+    unsigned long output = 0x00;
+    output = output | fourth;
+    output = output << 4;
+    output = output | thrid;
+    output = output << 4;
+    output = output | second;
+    output = output << 4;
+    output = output | first;
+    output = output | 0x040F0000;
+    ioctl(tux, TUX_SET_LED, output);
 }

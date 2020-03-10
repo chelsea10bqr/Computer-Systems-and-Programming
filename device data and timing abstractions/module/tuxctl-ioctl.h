@@ -1,5 +1,3 @@
-// All necessary declarations for the Tux Controller driver must be in this file
-
 #ifndef TUXCTL_H
 #define TUXCTL_H
 
@@ -11,4 +9,3 @@
 #define TUX_LED_ACK _IO('E', 0x15)
 
 #endif
-

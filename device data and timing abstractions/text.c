@@ -38,13 +38,7 @@
 #include <stdio.h>
 #include "text.h"
 
-/* constants*/
-#define CHAR_SIZE  (320/8)     /*max char size*/
-#define BAR_HEIGHT  (FONT_HEIGHT+2)
-#define BLANK    32             /*ascii for blank*/
-#define BAR_WIDTH   320
-#define BAR_SIZE  ((FONT_HEIGHT + 2) * 320)
-#define BIT_MASK  0x80     /*mask*/
+
 /*
  * These font data were read out of video memory during text mode and
  * saved here.  They could be read in the same manner at the start of a
@@ -55,117 +49,144 @@
  * Each byte represents a single bitmapped line of a single character.
  */
 
+
  /*
-  * update_status
-  *   DESCRIPTION: Update the value of status bar
-  *   INPUTS: time -- current time
-  *           level -- current map of the game
-  *           color_buffer -- buffer for the color value
-  *           color_bg -- color of background
-  *           color_text -- color of text
-  *
-  *   OUTPUTS: none
-  *   RETURN VALUE: none
-  *   SIDE EFFECTS: update the value of status bar
-  */
-void update_status(int time, int level, int fruit, unsigned char* color_buffer, unsigned char color_bg, unsigned char color_text){
-
-        int min, sec;
-        /*get the time in hours*/
-        min = time/60;
-        sec = time%60;
-        char buffS[CHAR_SIZE+1];
-
-        if(fruit > 1)
-        {
-          sprintf(buffS, "Level %d   %d Fruits   %02d:%02d" , level, fruit, min, sec);  /*store the string value in to string buffer*/
-          text_to_graphics(color_bg, color_text, color_buffer, buffS);    /*call text to graphics to show string in the game*/
-        }else{
-          sprintf(buffS, "Level %d   %d Fruit   %02d:%02d" , level, fruit, min, sec);   /*store the string value in to string buffer*/
-          text_to_graphics(color_bg, color_text, color_buffer, buffS);  /*call text to graphics to show string in the game*/
-        }
-}
-
-
-/*
- * text_to_graphics
- *   DESCRIPTION: display the value of some constants
- *   INPUTS: color_b -- the color of background
- *           color_t --the color of text
- *           color_buf -- the buffer for the value
- *           str -- the string need to display
- *
- *   OUTPUTS: none
- *   RETURN VALUE: none
- *   SIDE EFFECTS: display the value of some constants
+    show_status
+       DESPRIPTION: draw the status_bar in 4 planes
+       INPUTS: output: pointer to the buffer
+               input: pointer to the input
+       RETURN VALUE: NONE
+       SIDE EFFECTS: get the buffer
  */
-void text_to_graphics(unsigned char color_b,unsigned char color_t, unsigned char* color_buf,const char *str){
-        int i, j, k, start;
-        int  mask, char_data;
-        int string_length;
-        int num_p;
-        int rows_offset, start_offset, plane_offset;
-        int index;
-        int offset = 0;
+ void show_status(unsigned char * output, char * input)
+ {
+   char buffer[STATUS_BAR_SIZE * 4];
+   int len = strlen(input);
+   /*space for the text*/
+   int spaceColNum = (320 - len * FONT_WIDTH)/2;
 
-        unsigned char buffC[CHAR_SIZE+1]; /* array to store char*/
+   int i, j;
 
-        buffC[CHAR_SIZE] = 0;  /* the sentinel for the array , NULL char */
+   for (i = 0; i < 320; i++)
+   {
+     buffer[i] = BAR_COLOR; /* fill the topline for blank*/
+   }
+   for (i = 0; i < len; i++) /* traverse the buffer*/
+   {
+     char a = input[i];
+     int b = a;    /* store the ascii value*/
+     for (j = 0; j < FONT_HEIGHT; j++)
+     {
+       int p;
+       int s = font_data[b][j];
+       for (p = 0; p < FONT_WIDTH; p++)
+       {
+         int row = 1 + j;
+         int col = spaceColNum + (FONT_WIDTH * i) + p;
+         int spot = 320 * row + col;
+         int q = s >> (7 - p);
+         if (q & 1) /*check the bit*/
+         {
+           buffer[spot] = TEXT_COLOR; /* fill the color*/
+         }
+         else
+         {
+           buffer[spot] = BAR_COLOR;
+         }
+       }
 
-        for(i = 0; i < CHAR_SIZE; i++)  /* initialize the array */
-        {
-          buffC[i] = BLANK;
-        }
+       if (i == 0)
+       {
+         int odd1, odd2;  /*index for loops*/
+         for (odd1 = 0; odd1 < 2; odd1++)
+         {
+           for (odd2 = 0; odd2 < spaceColNum; odd2++)
+           {
+             int row = 1 + j;
+             int col = odd1 * (320 - spaceColNum) + odd2;
+             int spot = 320 * row + col;
+             buffer[spot] = BAR_COLOR;
+           }
+         }
+       }
+     }
+   }
+
+   for (i = 5440; i < 5760; i++)
+   {
+     buffer[i] = BAR_COLOR;   /* fill with blank*/
+   }
+
+   for (i = 0; i < 4; i++)
+   {
+     for (j = 0; j < STATUS_BAR_SIZE; j++)
+     {
+       int output_i = i * STATUS_BAR_SIZE + j;
+       int buffer_i = i + j * 4;
+       output[output_i] = buffer[buffer_i];
+     }
+   }
+ }
 
 
-        if(str[0] !=0)   /* if it is not null, store the string*/
-        {
-          string_length = (int)strlen(str);
+ /*
+     text_draw
+       DESPRIPTION: draw the floating message
+       INPUTS: output: pointer to the output
+               input: pointer to the string
+       RETURN VALUE: NONE
+       SIDE EFFECTS: generate the text
+ */
+ void text_draw(unsigned char * output, char * input)
+ {
+   int len = strlen(input);
+   int spaceColNum = (CAPTION_TEXT_NUM - len)*FONT_WIDTH/2;
 
-          for(i = 0; i < string_length; i++)
-          {
-              buffC[i] = str[i];
-          }
+   int i, j;
+
+   for (i = 0; i < len; i++)
+   {
+     char a = input[i];
+     int b = a;
+     for (j = 0; j < FONT_HEIGHT; j++)   /* traverse the buffer*/
+     {
+       int p;
+       int s = font_data[b][j];
+       for (p = 0; p < FONT_WIDTH; p++)
+       {
+         int row = j;
+         int col = spaceColNum + (FONT_WIDTH * i) + p;
+         int spot = X_TEXT * row + col;
+         int q = s >> (7 - p);
+         if (q & 1) /* wether it is 1*/
+         {
+           output[spot] = 0x01;  /* fill with blank*/
+         }
+         else
+         {
+           output[spot] = 0x00;
+         }
+       }
+
+       if (i == 0)
+       {
+         int odd1, odd2;  /*index for loop*/
+         for (odd1 = 0; odd1 < 2; odd1++)
+         {
+           for (odd2 = 0; odd2 < spaceColNum; odd2++)
+           {
+             int row = j;
+             int col = odd1 * (X_TEXT - spaceColNum) + odd2;
+             int spot = X_TEXT * row + col;
+             output[spot] = 0x00;
+           }
+         }
+       }
+     }
+   }
+ }
 
 
-          offset = (BAR_WIDTH - FONT_WIDTH * string_length)/2;
-        }
-
-        for(i = 0; i < BAR_SIZE; i++)   /* set the background color*/
-        {
-          color_buf[i] = color_b;
-        }
-
-        for(i = 0; i < CHAR_SIZE; i++)   /*traversal of all pixels*/
-        {
-          start = i * FONT_WIDTH + offset;
-          index = (int)buffC[i];
-
-          for(j = 0; j < FONT_HEIGHT; j++)
-          {
-              mask = BIT_MASK;
-
-              for(k = 0; k < FONT_WIDTH; k++)
-              {
-                  char_data = font_data[index][j];
-
-                  if(char_data & mask)      /* set the player color */
-                  {
-                      num_p = k & 3;
-
-                      rows_offset = ((j+1)*BAR_WIDTH)/4;
-                      start_offset = (k + start)/4;
-                      plane_offset = num_p * ((BAR_WIDTH * BAR_HEIGHT)/4);
-                      color_buf[rows_offset + start_offset + plane_offset] = color_t;
-                  }
-                  mask = mask >> 1;
-
-              }
-          }
-
-        }
-
-}
 
 unsigned char font_data[256][16] = {
     {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,

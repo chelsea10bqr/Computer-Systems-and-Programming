@@ -40,13 +40,19 @@
 /* The default VGA text mode font is 8x16 pixels. */
 #define FONT_WIDTH   8
 #define FONT_HEIGHT  16
+#define STATUS_BAR_SIZE 	1440
+#define BUF_WIDTH			320
+#define TEXT_COLOR       0x24
+#define BAR_COLOR        0x26
+#define CAPTION_TEXT_NUM  16
+#define X_TEXT    128
 
 
 /* Standard VGA text font. */
 extern unsigned char font_data[256][16];
 
-void text_to_graphics(unsigned char color_b,unsigned char color_t, unsigned char* color_buf,const char *str);
+void show_status(unsigned char * buffer, char * input);
 
-void update_status(int time, int level, int fruit, unsigned char* color_buffer, unsigned char color_bg, unsigned char color_text);
+void text_draw(unsigned char * output, char * input);
 
 #endif /* TEXT_H */
